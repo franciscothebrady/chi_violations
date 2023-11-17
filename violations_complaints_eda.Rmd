@@ -1,0 +1,404 @@
+---
+title: "Violations & Complaints"
+author: "Francisco Brady"
+date: "2023-04-14"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    theme: united
+    toc_float:
+      collapsed: false
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# setup libs
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(janitor)
+library(kableExtra)
+library(sf)
+
+## read in data 
+violations <- vroom::vroom('building_violations.csv') %>% 
+  mutate(`VIOLATION LAST MODIFIED DATE` = mdy(`VIOLATION LAST MODIFIED DATE`),
+         `VIOLATION DATE` = mdy(`VIOLATION DATE`),
+         `VIOLATION STATUS DATE` = mdy(`VIOLATION STATUS DATE`) ) 
+
+ordinance_violations <- vroom::vroom('ordinance_violations.csv') %>%
+  mutate(`HEARING DATE` = mdy(`HEARING DATE`),
+         `VIOLATION DATE` = mdy_hms(`VIOLATION DATE`),
+         `LAST MODIFIED DATE` = mdy_hms(`LAST MODIFIED DATE`)
+         ) %>%
+  # drop strangely old dates for now 
+  filter(year(`VIOLATION DATE`) >= 2006, 
+         year(`VIOLATION DATE`) <= year(today())) 
+  # convert to regular dates 
+ordinance_violations <- ordinance_violations %>%
+  mutate(across(contains('DATE'), lubridate::as_date))
+
+calls_311 <- vroom::vroom('calls_311.csv.gz', guess_max = 300) %>%
+  # convert dates 
+  mutate(CREATED_DATE = mdy_hms(CREATED_DATE),
+         LAST_MODIFIED_DATE = mdy_hms(LAST_MODIFIED_DATE),
+         CLOSED_DATE = mdy_hms(CLOSED_DATE)) %>%
+  mutate(across(contains('DATE'), lubridate::as_date))
+  
+
+# ordinance_violations %>% select(contains('DATE')) %>% View
+## game plan : 
+# 1. read in data 
+# 2. formats
+# 3. time coverage 
+# 4. types of complaints 
+# 5. valid addresses
+
+## helper functions 
+missing_table <- 
+  function(df) {
+    df %>%
+      summarise(across(everything(), ~ sum(is.na(.x)) / length(.x), .names = "{.col}_missing")) %>%
+      pivot_longer(cols = everything()) %>%
+      separate(name, into = c('variable','stat'), sep="_(?=[^_]+$)") %>%
+      pivot_wider(names_from = 'stat', values_from = 'value') %>%
+      mutate(pct_missing = round(100*missing, 2)) %>%
+      select(variable,
+             pct_missing) -> tbl
+    return(tbl)
+  }
+
+# map data 
+chi_sf <- tigris::places(state = 'IL') %>% filter(NAME == 'Chicago')
+```
+
+## Building Violations 
+
+Building violations dataset from the City of Chicago. Coverage is fairly well distributed throughout the city. 
+
+### Data Format  
+
+```{r violations-summary}
+varnames <- setNames(stack(sapply(violations, class))[2:1], c('variable', 'class'))
+
+records <- format(nrow(violations), big.mark = ',')
+# add pct missing 
+summary <- violations %>% 
+  missing_table() %>%
+  right_join(varnames, c('variable' = 'variable')) %>%  
+  # rearrange
+  select('Variable' = variable,
+         'Type' = class,
+         'Percent Missing' = pct_missing)
+  # print
+summary %>% knitr::kable() %>% 
+  kable_styling("striped", full_width = F) %>% 
+  add_footnote(glue::glue('N = {records}')) %>%
+  scroll_box(height = "300px")
+```
+
+### Date Coverage
+
+```{r violations-time}
+time <- violations %>%
+  select(contains('DATE')) %>% #names
+  summarise(across(.cols = everything(), 
+                   # use in anonymous function to include na.rm arg
+                   list(min = function(x) min(x, na.rm=TRUE), 
+                        max = function(x) max(x, na.rm=TRUE)))) %>%
+  pivot_longer(cols = everything()) %>%
+  separate(name, into = c('variable','stat'), sep="_(?=[^_]+$)") %>%
+      pivot_wider(names_from = 'stat', values_from = 'value')
+
+# print
+time %>% knitr::kable(col.names = c('Variable', 'Minimum', 'Maximum')) %>% 
+  kable_styling("striped", full_width = F) 
+
+```
+
+### Top 50 Violations 
+```{r, violations-type}
+ords <-  violations %>%
+  filter(!is.na(`VIOLATION ORDINANCE`)) %>%
+  group_by(`VIOLATION ORDINANCE`) %>% summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  filter(row_number() <= 50) 
+
+ords %>% knitr::kable(col.names = c('Ordinance', 'Count'), 
+                      format.args = list(big.mark = ',')) %>% 
+  kable_styling("striped", full_width = F) %>% 
+  scroll_box(height = "300px")
+
+```
+
+### Geographic Coverage 
+
+Only showing the latest year of data. 
+
+```{r, v-geo, warning=FALSE, message=FALSE}
+
+# st_crs(chi_sf)
+v_sf <- violations %>% 
+  filter(!is.na(LONGITUDE), !is.na(LATITUDE)) %>%
+  mutate(year = year(`VIOLATION DATE`)) %>%
+  select(year, LONGITUDE, LATITUDE) %>%
+  filter(year == max(year)) %>%
+  st_as_sf(coords = c("LONGITUDE","LATITUDE")) %>%
+  st_set_crs(st_crs(chi_sf))
+
+ggplot() + 
+  geom_sf(data = chi_sf) +
+  geom_sf(data = v_sf,
+    aes(geometry = geometry), 
+    color = 'cadetblue',
+    alpha = .5,
+    stat = "sf_coordinates"
+  ) +
+  theme_light() + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank()) +
+  labs(title = 'Building Violations', 
+       caption = glue::glue('Year: {max(year(max(violations$`VIOLATION DATE`)))}'))
+
+
+```
+
+## Ordinance Violations
+
+### Data Format  
+
+```{r ords-summary}
+varnames <- setNames(stack(sapply(ordinance_violations, class))[2:1], c('variable', 'class'))
+
+records <- format(nrow(ordinance_violations), big.mark = ',')
+# add pct missing 
+summary <- ordinance_violations %>% 
+  missing_table() %>%
+  right_join(varnames, c('variable' = 'variable')) %>%  
+  # rearrange
+  select('Variable' = variable,
+         'Type' = class,
+         'Percent Missing' = pct_missing)
+  # print
+summary %>% knitr::kable() %>% 
+  kable_styling("striped", full_width = F) %>% 
+  add_footnote(glue::glue('N = {records}')) %>%
+  scroll_box(height = "300px")
+```
+
+### Date Coverage
+
+```{r ords-time}
+time <- ordinance_violations %>%
+  select(contains('DATE')) %>% #View
+  summarise(across(.cols = everything(), 
+                   # use in anonymous function to include na.rm arg
+                   list(min = function(x) min(x, na.rm=TRUE), 
+                        max = function(x) max(x, na.rm=TRUE)))) %>%
+  pivot_longer(cols = everything()) %>%
+  separate(name, into = c('variable','stat'), sep="_(?=[^_]+$)") %>%
+  mutate(value = as_date(value)) %>%
+      pivot_wider(names_from = 'stat', values_from = 'value')
+
+# print
+time %>% knitr::kable(col.names = c('Variable', 'Minimum', 'Maximum')) %>% 
+  kable_styling("striped", full_width = F) 
+
+```
+
+### Top 50 Ordinance Violations 
+```{r, ords-type}
+ords <-  ordinance_violations %>%
+  filter(!is.na(`VIOLATION DESCRIPTION`)) %>%
+  group_by(`VIOLATION DESCRIPTION`) %>% summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  filter(row_number() <= 50) 
+
+ords %>% knitr::kable(col.names = c('Description', 'Count'), 
+                      format.args = list(big.mark = ',')) %>% 
+  kable_styling("striped", full_width = F) %>% 
+  scroll_box(height = "300px")
+
+```
+
+### Geographic Coverage 
+
+Only showing the latest year of data. 
+
+```{r, o-geo, warning=FALSE, message=FALSE}
+
+# st_crs(chi_sf)
+o_sf <- ordinance_violations %>% 
+  filter(!is.na(LONGITUDE), !is.na(LATITUDE)) %>%
+  mutate(year = year(`VIOLATION DATE`)) %>%
+  select(year, LONGITUDE, LATITUDE) %>%
+  filter(year == max(year, na.rm = T)) %>%
+  st_as_sf(coords = c("LONGITUDE","LATITUDE")) %>%
+  st_set_crs(st_crs(chi_sf))
+
+ggplot() + 
+  geom_sf(data = chi_sf) +
+  geom_sf(data = o_sf,
+    aes(geometry = geometry), 
+    color = 'cadetblue',
+    alpha = .5,
+    stat = "sf_coordinates"
+  ) +
+  theme_light() + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank()) +
+  labs(title = 'Ordinance Violations', caption = glue::glue('Year: {max(year(max(ordinance_violations$`VIOLATION DATE`)))}')) 
+
+
+```
+
+## 311 Calls 
+
+### Data Format  
+
+```{r summary-311}
+varnames <- setNames(stack(sapply(calls_311, class))[2:1], c('variable', 'class'))
+
+records <- format(nrow(calls_311), big.mark = ',')
+# add pct missing 
+summary <- calls_311 %>% 
+  missing_table() %>%
+  right_join(varnames, c('variable' = 'variable')) %>%  
+  # rearrange
+  select('Variable' = variable,
+         'Type' = class,
+         'Percent Missing' = pct_missing)
+# print
+summary %>% knitr::kable() %>% 
+  kable_styling("striped", full_width = F) %>% 
+  add_footnote(glue::glue('N = {records}')) %>%
+  scroll_box(height = "300px")
+```
+
+### Date Coverage
+
+```{r time-311}
+time <- calls_311 %>%
+  select(contains('DATE')) %>% #View
+  summarise(across(.cols = everything(), 
+                   # use in anonymous function to include na.rm arg
+                   list(min = function(x) min(x, na.rm=TRUE), 
+                        max = function(x) max(x, na.rm=TRUE)))) %>%
+  pivot_longer(cols = everything()) %>%
+  separate(name, into = c('variable','stat'), sep="_(?=[^_]+$)") %>%
+  mutate(value = as_date(value)) %>%
+      pivot_wider(names_from = 'stat', values_from = 'value')
+
+# print
+time %>% knitr::kable(col.names = c('Variable', 'Minimum', 'Maximum')) %>% 
+  kable_styling("striped", full_width = F) 
+
+```
+
+### Top 50 Call Types
+
+Excluding information only 311 calls.
+
+```{r, type-311}
+calls <-  calls_311 %>%
+  filter(!grepl('INFORMATION ONLY', SR_TYPE)) %>%
+  group_by(SR_TYPE) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  filter(row_number() <= 50) 
+
+calls %>% knitr::kable(col.names = c('Call Type', 'Count'), 
+                      format.args = list(big.mark = ',')) %>% 
+  kable_styling("striped", full_width = F) %>% 
+  scroll_box(height = "300px")
+
+```
+
+### Geographic Coverage: All Calls
+
+Only showing the latest year of data. 
+
+```{r, geo-311, warning=FALSE, message=FALSE}
+
+# st_crs(chi_sf)
+c_sf <- calls_311 %>% 
+  filter(!is.na(LONGITUDE), !is.na(LATITUDE)) %>%
+  mutate(year = year(CREATED_DATE)) %>%
+  select(year, LONGITUDE, LATITUDE) %>%
+  filter(year == max(year, na.rm = T)) %>%
+  st_as_sf(coords = c("LONGITUDE","LATITUDE")) %>%
+  st_set_crs(st_crs(chi_sf))
+
+ggplot() + 
+  geom_sf(data = chi_sf) +
+  geom_sf(data = c_sf,
+    aes(geometry = geometry), 
+    color = 'cadetblue',
+    alpha = .5,
+    stat = "sf_coordinates"
+  ) +
+  theme_light() + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank()) +
+  labs(title = '311 Calls', caption = glue::glue('Year: {max(year(max(calls_311$CREATED_DATE)))}')) 
+
+
+```
+
+### Geographic Coverage: Building Complaints
+
+Highlighting the types of complaints received that mention buildings:
+
+```{r}
+calls_311 %>% 
+  filter(grepl('Building', SR_TYPE, ignore.case = TRUE)) %>%
+  tabyl(SR_TYPE) %>% kable()
+  
+```
+
+```{r, geo-311-types, warning=FALSE, message=FALSE}
+
+# st_crs(chi_sf)
+c_sf <- calls_311 %>% 
+  filter(!is.na(LONGITUDE), !is.na(LATITUDE)) %>%
+  filter(grepl('Building', SR_TYPE)) %>%
+  mutate(year = year(CREATED_DATE)) %>%
+  select(year, LONGITUDE, LATITUDE, SR_TYPE) %>%
+  filter(year == max(year, na.rm = TRUE)) %>%
+  st_as_sf(coords = c("LONGITUDE","LATITUDE")) %>%
+  st_set_crs(st_crs(chi_sf))
+
+ggplot() + 
+  geom_sf(data = chi_sf) +
+  geom_sf(data = c_sf,
+    aes(geometry = geometry, 
+        color = SR_TYPE),
+    stat = "sf_coordinates"
+  ) +
+  theme_light() + 
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank()) +
+  labs(title = '311 Calls: Building Complaints', 
+       caption = glue::glue('Year: {max(year(max(calls_311$CREATED_DATE)))}')) 
+
+
+```
+
